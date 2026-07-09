@@ -19,6 +19,8 @@ Minimal rollouts for the async recipe (`training/recipes/async_rl_loop.py`):
 - `eval_protocol_chat/` — OpenAI-style messages sent through an Eval Protocol
   `RemoteRolloutProcessor` server; the completed chat rollout is converted
   into the async recipe's `RolloutRun` format with a cookbook renderer.
+- `exa_search/`: multi-turn web-search agent with native tool calling
+  (Exa `search`/`get_contents`) and an LLM-judge reward on multi-hop QA.
 
 Each example exposes `rollout_fn_factory(setup) -> rollout_fn` (signature
 `async def rollout_fn(sample_prompt) -> RolloutRun | None`) and a `train.py`

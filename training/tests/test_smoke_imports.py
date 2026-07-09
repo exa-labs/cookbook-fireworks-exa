@@ -88,6 +88,8 @@ EXAMPLE_MODULES = [
     "training.examples.rl.deepmath.prepare_data",
     "training.examples.rl.single_turn_token_in.rollout",
     "training.examples.rl.multi_turn_message_in.rollout",
+    "training.examples.rl.exa_search.rollout",
+    "training.examples.rl.exa_search.prepare_data",
     "training.examples.tools.promote_checkpoint",
 ]
 

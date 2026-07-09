@@ -35,6 +35,9 @@ dev = [
 coding-agent = [
     "swebench @ git+https://github.com/SWE-Gym/SWE-Bench-Fork.git",
 ]
+exa-search = [
+    "exa-py>=1.0.0",
+]
 
 [tool.setuptools.packages.find]
 where = [".."]

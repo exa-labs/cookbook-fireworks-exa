@@ -1,0 +1,7 @@
+# Materialized dataset; regenerate with `python prepare_data.py`.
+dataset.jsonl
+smoke.jsonl
+*.jsonl
+# Training run artifacts.
+exa_search_logs/
+*_logs/
