@@ -4,10 +4,10 @@
 Run ``prepare_data.py`` first to materialize ``dataset.jsonl``, then::
 
     python train.py \\
-        --base-model accounts/fireworks/models/qwen3-4b \\
-        --tokenizer-model Qwen/Qwen3-4B \\
+        --base-model accounts/fireworks/models/qwen3-4b-instruct-2507 \\
+        --tokenizer-model Qwen/Qwen3-4B-Instruct-2507 \\
         --max-turns 6 \\
-        --output-model-id accounts/<acct>/models/exa-search-agent
+        --output-model-id exa-search-agent
 
 Required environment (put these in ``training/.env``; loaded via python-dotenv):
     FIREWORKS_API_KEY   -- Fireworks training + inference (and the default judge)
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Async RL for an Exa web-search agent")
     # Model / data
     p.add_argument("--base-model", default="accounts/fireworks/models/qwen3-4b-instruct-2507",
-                   help="Fireworks model resource name to fine-tune (blog: Qwen3-4B-Instruct-2507).")
+                   help="Fireworks model resource name to fine-tune.")
     p.add_argument("--tokenizer-model", default="Qwen/Qwen3-4B-Instruct-2507",
                    help="HF tokenizer id (must match the base model's tokenizer).")
     p.add_argument("--dataset-path", default=DEFAULT_DATASET)
@@ -80,14 +80,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-completion-tokens", type=int, default=2048,
                    help="Per-turn generation budget (thinking + one tool call).")
     p.add_argument("--lora-rank", type=int, default=32,
-                   help="LoRA rank (blog uses LoRA; 0 = full-parameter training).")
+                   help="LoRA rank (0 = full-parameter training).")
     p.add_argument("--max-head-offpolicy-versions", type=int, default=0,
                    help="Off-policy staleness budget (0 = strict on-policy).")
     p.add_argument("--max-concurrency-rollout-sample", type=int, default=None,
                    help="Cap on in-flight LLM calls against the deployment (>= completions-per-prompt).")
     p.add_argument("--no-filter-constant-reward", action="store_true",
-                   help="Keep prompt groups whose rewards are all identical "
-                        "(by default they are dropped -- GRPO advantage is 0 there).")
+                   help="Keep constant-reward prompt groups (dropped by default; "
+                        "GRPO advantage is 0 there).")
     # Agent / search / judge
     p.add_argument("--max-turns", type=int, default=6,
                    help="Max search/answer turns per question.")
@@ -95,32 +95,20 @@ def parse_args() -> argparse.Namespace:
                    choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"],
                    help="Exa search type. 'fast' is cheaper/lower-latency for high-throughput RL.")
     p.add_argument("--num-results", type=int, default=5,
-                   help="Exa results returned per search (blog: 5).")
+                   help="Exa results returned per search.")
     p.add_argument("--exa-qps", type=float, default=10.0,
                    help="Client-side cap on Exa API requests/second across all "
                         "concurrent rollouts (Exa's default account limit is 10; "
                         "0 disables).")
     p.add_argument("--max-trajectory-tokens", type=int, default=30720,
                    help="Hard cap on prompt+completion tokens per trajectory; exceeding it "
-                        "ends the episode with the context-overflow penalty (blog: 30720).")
-    p.add_argument("--context-overflow-penalty", type=float, default=-0.25,
-                   help="Reward when the trajectory exceeds --max-trajectory-tokens (blog: -0.25).")
-    p.add_argument("--no-answer-penalty", type=float, default=-0.1,
-                   help="Reward when the agent burns all turns without giving a final answer.")
-    p.add_argument("--judge-model", default=None,
-                   help="Override the LLM judge model (default: "
-                        "accounts/fireworks/models/qwen3p7-plus; the judge must "
-                        "answer without a reasoning trace).")
+                        "ends the episode with the context-overflow penalty.")
     # Infra / logging
     p.add_argument("--dcp-save-interval", type=int, default=10,
                    help="Save a resumable checkpoint every N optimizer steps (0 = final only).")
     p.add_argument("--init-from-checkpoint", default=None,
-                   help="Resume from a prior checkpoint to train further. Cross-job "
-                        "form is \"<job-id>:step-N\" (e.g. the printed trainer job id "
-                        "plus \"step-60\"); a bare \"step-N\" resumes within the same "
-                        "job. Resume restores optimizer state, step count, and how many "
-                        "rows were already consumed -- raise --epochs or --max-rows so "
-                        "there is fresh data left to train on.")
+                   help="Resume from a prior checkpoint: \"<job-id>:step-N\" cross-job, "
+                        "bare \"step-N\" within the same job. See README: Resuming.")
     p.add_argument("--training-shape-id", default=os.environ.get("TRAINING_SHAPE") or None,
                    help="Training shape resource name; auto-selected if unset.")
     p.add_argument("--replica-count", type=int, default=None,
@@ -148,10 +136,7 @@ def run() -> None:
 
         errors = validate_output_model_id(args.output_model_id)
         if errors:
-            raise ValueError(
-                "Invalid --output-model-id (fix now, not after training): "
-                + "; ".join(errors)
-            )
+            raise ValueError("Invalid --output-model-id: " + "; ".join(errors))
 
     rows = list(_iter_rows(args.dataset_path, args.max_rows))
     logger.info("Loaded %d rows from %s", len(rows), args.dataset_path)
@@ -203,9 +188,6 @@ def run() -> None:
         "num_results": args.num_results,
         "exa_qps": args.exa_qps,
         "max_trajectory_tokens": args.max_trajectory_tokens,
-        "context_overflow_penalty": args.context_overflow_penalty,
-        "no_answer_penalty": args.no_answer_penalty,
-        "judge_model": args.judge_model,
     }
 
     logger.info(

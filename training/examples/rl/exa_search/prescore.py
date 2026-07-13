@@ -30,7 +30,14 @@ from collections import Counter
 
 from dotenv import load_dotenv
 
-from training.examples.rl.exa_search.eval import ControlPlane, run_episode
+from training.examples.rl.exa_search.eval import (
+    ControlPlane,
+    add_agent_args,
+    make_inference_client,
+    provisioned_deployment,
+    require_api_keys,
+    run_episode,
+)
 from training.examples.rl.exa_search.exa_search import ExaSearchConfig, ExaSearchTool
 from training.examples.rl.exa_search.reward import AnswerJudge, JudgeConfig
 
@@ -45,7 +52,6 @@ _TRAINING_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "
 load_dotenv(os.path.join(_TRAINING_ROOT, ".env"))
 load_dotenv(os.path.join(_TRAINING_ROOT, "..", ".env"))
 
-INFERENCE_BASE = "https://api.fireworks.ai/inference/v1"
 DEFAULT_DATASET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.jsonl")
 
 
@@ -63,14 +69,7 @@ def _load_rows(path: str, max_rows: int | None) -> list[dict]:
 
 
 async def score_rows(rows: list[dict], model_route: str, args: argparse.Namespace) -> list[dict]:
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(
-        base_url=INFERENCE_BASE,
-        api_key=os.environ["FIREWORKS_API_KEY"],
-        timeout=180.0,
-        max_retries=3,
-    )
+    client = make_inference_client()
     exa_tool = ExaSearchTool(
         ExaSearchConfig(
             search_type=args.search_type,
@@ -112,31 +111,17 @@ async def score_rows(rows: list[dict], model_route: str, args: argparse.Namespac
 
 def main() -> None:
     args = parse_args()
-    for var in ("FIREWORKS_API_KEY", "EXA_API_KEY"):
-        if not os.environ.get(var):
-            raise RuntimeError(f"{var} is not set (put it in training/.env).")
+    require_api_keys()
 
     rows = _load_rows(args.dataset_path, args.max_rows)
     logger.info("Scoring %d rows x %d samples against %s", len(rows), args.samples, args.base_model)
 
     cp = ControlPlane(os.environ["FIREWORKS_API_KEY"])
-    deployment = args.deployment
-    created = False
-    if deployment and not deployment.startswith("accounts/"):
-        deployment = f"accounts/{cp.account_id}/deployments/{deployment}"
-    if deployment is None:
-        deployment = cp.create_deployment(args.base_model, args.accelerator)
-        created = True
-
-    try:
-        cp.wait_deployment_ready(deployment)
+    with provisioned_deployment(
+        cp, args.base_model, args.accelerator, args.deployment, args.keep_deployment
+    ) as deployment:
         route = f"{args.base_model}#{deployment}"
         scored = asyncio.run(score_rows(rows, route, args))
-    finally:
-        if created and not args.keep_deployment:
-            cp.delete_deployment(deployment)
-        elif created:
-            logger.info("Keeping deployment %s (billing until deleted)", deployment)
 
     dist = Counter(
         "all_wrong" if r["base_samples"] and r["base_correct"] == 0
@@ -164,8 +149,8 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Offline base-model difficulty scoring for RL data")
-    p.add_argument("--base-model", default="accounts/fireworks/models/qwen3-4b-instruct-2507",
-                   help="Model to score difficulty against (must match the RL base model).")
+    # Temperature 1.0 matches training sampling, so difficulty is on-distribution.
+    add_agent_args(p, temperature=1.0, concurrency=24)
     p.add_argument("--dataset-path", default=DEFAULT_DATASET)
     p.add_argument("--out-path", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "dataset.prescored.jsonl"))
@@ -173,19 +158,6 @@ def parse_args() -> argparse.Namespace:
                    help="Score only the first N rows (default: all).")
     p.add_argument("--samples", type=int, default=8,
                    help="Base-model samples per question (match --completions-per-prompt).")
-    p.add_argument("--deployment", default=None,
-                   help="Existing deployment id/name to route through (skips create+delete).")
-    p.add_argument("--keep-deployment", action="store_true")
-    p.add_argument("--accelerator", default="NVIDIA_B200_180GB")
-    p.add_argument("--max-turns", type=int, default=6)
-    p.add_argument("--temperature", type=float, default=1.0,
-                   help="Sampling temperature (match training's 1.0 so difficulty is on-distribution).")
-    p.add_argument("--max-tokens", type=int, default=2048)
-    p.add_argument("--search-type", default="auto",
-                   choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"])
-    p.add_argument("--num-results", type=int, default=5)
-    p.add_argument("--exa-qps", type=float, default=10.0)
-    p.add_argument("--concurrency", type=int, default=24)
     return p.parse_args()
 
 

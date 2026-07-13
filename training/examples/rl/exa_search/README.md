@@ -6,12 +6,10 @@ search the open web, read results, and answer multi-hop questions. RL
 rewards it for getting the answer right.
 
 > **Reference**: Exa, *"How Search Quality Shapes RL Outcomes"*
-> ([exa.ai/blog/rl-search-outcomes](https://exa.ai/blog/rl-search-outcomes), 2026).
-> That study holds everything fixed except the search backend and finds that
-> agents trained with **Exa** reach higher pass@k at **lower training and
-> inference cost** than agents trained with a SERP (Google-proxy) backend: a
-> stronger retriever surfaces the supporting evidence in fewer turns, so more
-> rollouts reach a correct answer and the reward signal is denser.
+> ([exa.ai/blog/rl-search-outcomes](https://exa.ai/blog/rl-search-outcomes), 2026),
+> which finds that agents trained with Exa as the RL search backend reach
+> higher performance with less training compute than a SERP baseline. This
+> example follows that setup.
 
 ## Why this example
 
@@ -51,19 +49,18 @@ question ─▶ model ─▶ <tool_call> search(query) ──────▶ Exa
   Results come back as `role="tool"` messages. Exa calls are async
   (`AsyncExa`), retried with backoff on transient errors, and cached across
   the GRPO group's duplicate queries.
-- **Episode end**: idiomatically, there is no "submit" tool: the episode ends
-  when the model replies **without** calling a tool; that message is its final
-  answer (extracted after the `Answer:` prefix the system prompt requests).
-  This matches both the Fireworks agent loop and the blog's reference
-  implementation.
+- **Episode end**: there is no "submit" tool: the episode ends when the model
+  replies **without** calling a tool; that message is its final answer
+  (extracted after the `Answer:` prefix the system prompt requests). This
+  matches the standard Fireworks agent loop.
 - **Rollout** (`rollout.py`): runs the tool loop for up to `--max-turns`,
   packing the whole conversation into one `RolloutRun`.
   `MessageTrajectoryAssembler` keeps the per-token loss mask aligned: `1` on
   assistant-generated tokens, `0` on the prompt and the injected tool
   observations. A trajectory that would exceed `--max-trajectory-tokens` ends
-  early with the **−0.25 context-overflow penalty** (the exact condition the
-  blog penalizes); burning all turns without answering costs a smaller
-  `--no-answer-penalty`.
+  early with a **−0.25 context-overflow penalty**; burning all turns without
+  answering costs a smaller −0.1 penalty (both constants at the top of
+  `rollout.py`).
 - **Reward** (`reward.py`): an **LLM judge** grades the final answer against the
   gold answer(s) (1.0 / 0.0), following the SimpleQA-style grader the blog uses
   (exact-match was dropped because the agent learned to reward-hack answer
@@ -81,6 +78,7 @@ question ─▶ model ─▶ <tool_call> search(query) ──────▶ Exa
 | `reward.py` | LLM-as-judge answer grading (Fireworks-hosted by default): binary correct/incorrect. |
 | `rollout.py` | `make_rollout_fn(setup)`: the multi-turn search/answer loop. |
 | `prepare_data.py` | Builds `dataset.jsonl`; defaults to the blog's 50/50 HotpotQA+MuSiQue train mix. |
+| `prescore.py` | Optional offline pass: scores each question's difficulty against the base model and keeps only the mixed-difficulty rows RL can learn from. |
 | `train.py` | Wires the dataset + rollout factory into `recipes.async_rl_loop.main`. |
 | `eval.py` | Held-out eval (base vs. tuned adapter): accuracy, searches/episode, transcripts. |
 | `run.sh` | Canned end-to-end run (`SMOKE=1` for a tiny/cheap version). |
@@ -100,7 +98,7 @@ question ─▶ model ─▶ <tool_call> search(query) ──────▶ Exa
    ```
    FIREWORKS_API_KEY=...   # Fireworks training + inference, and the default LLM judge
    EXA_API_KEY=...         # Exa search backend: https://dashboard.exa.ai/api-keys
-   WANDB_API_KEY=...        # optional, for metric logging
+   WANDB_API_KEY=...       # optional, for metric logging
    ```
 
    The judge defaults to a Fireworks-hosted model; point it elsewhere with
@@ -181,7 +179,8 @@ python eval.py \
 It provisions one dedicated deployment of the base model, attaches the
 adapter(s) as LoRA addons, evaluates every model through that single GPU, and
 deletes the deployment on exit (`--keep-deployment` / `--deployment <id>` to
-reuse one). Per-question transcripts land in `eval_results/<timestamp>/`; the
+reuse one). The deployment defaults to `--accelerator NVIDIA_H100_80GB`; pick
+a tier your account has quota for. Per-question transcripts land in `eval_results/<timestamp>/`; the
 summary table reports accuracy, searches/episode, turns/episode, and
 no-answer rate per model.
 
@@ -197,9 +196,11 @@ no-answer rate per model.
 | `--completions-per-prompt` | `8` | 8 | GRPO group size per question. |
 | `--prompt-groups-per-step` | `8` | n/a | Questions per optimizer step. |
 | `--max-trajectory-tokens` | `30720` | 30720 | Token budget per trajectory; exceeding it ends the episode. |
-| `--context-overflow-penalty` | `-0.25` | −0.25 | Reward when the trajectory exceeds the token budget. |
-| `--no-answer-penalty` | `-0.1` | ~−0.1 | Reward when all turns pass without a final answer (blog: format penalty). |
 | `--kl-beta` | `0.0` | 0.0 | KL penalty vs. the reference policy. |
+
+Two reward constants follow the blog and are fixed in `rollout.py`:
+`CONTEXT_OVERFLOW_PENALTY = -0.25` (trajectory exceeds the token budget) and
+`NO_ANSWER_PENALTY = -0.1` (all turns pass without a final answer).
 
 ## Data
 
@@ -210,29 +211,30 @@ filtered to HotpotQA rows with gold-answer alias lists) + **MuSiQue** (via
 stay clean for evaluating the trained agent. Single-source variants
 (`--dataset hotpotqa|musique|2wiki`) are available for ablations.
 
-One difference from the blog remains, by design: the blog also **pre-scores**
-every question offline (base model, 8 samples each) and trains only on
-mixed-difficulty questions (`0 < correct < 8`), so no rollout budget is spent
-on questions the whole GRPO group gets uniformly right or wrong. This example
-instead drops those constant-reward groups **at runtime** (the default
-`dynamic_filter_fn` in `train.py`): zero up-front cost, at the price of some
-wasted rollout throughput. If you scale this up, reproducing the offline
-scoring pass is the first optimization worth making.
+By default, `train.py` drops constant-reward prompt groups **at runtime** (the
+`dynamic_filter_fn`): groups the model gets uniformly right or wrong have zero
+GRPO advantage, so they waste rollout budget. `prescore.py` moves that
+filtering **offline**, as the blog does: it samples the base model
+`--samples` times per question, keeps only the mixed-difficulty band
+(`0 < correct < samples`), and writes `dataset.prescored.jsonl`. Train on it
+with `--dataset-path dataset.prescored.jsonl --no-filter-constant-reward`;
+nearly every group then yields a gradient, at the cost of one up-front scoring
+pass (it provisions and tears down a deployment, like `eval.py`).
+
+```bash
+python prescore.py --samples 8 --temperature 1.0
+```
 
 The blog trains with **Dr. GRPO**; the recipe's default `policy_loss="grpo"`
 (REINFORCE + KL) is the closest available variant; see the async-RL reference
 for the full list.
 
-## Reproducing the backend comparison
+## Swapping the search backend
 
-The blog's headline is comparative (Exa vs. a Google/SERP proxy). This example
-ships the **Exa** side and makes the backend a one-line swap: `ExaSearchTool` is
-the only search-specific piece the rollout depends on. To reproduce the
-head-to-head, implement a `SerpSearchTool` with the same
-`search(query) -> observation` interface, select it via a flag, and train a
-second run with everything else fixed, then compare reward curves and per-rollout
-token/turn/search-call counts (Figures 2–4 in the blog). We keep this example
-Exa-only; see the blog for the published comparison.
+`ExaSearchTool` is the only search-specific piece the rollout depends on, so
+comparing backends (as the blog does) means implementing another tool with the
+same `search(query) -> observation` interface and training a second run with
+everything else fixed.
 
 ## Cost
 

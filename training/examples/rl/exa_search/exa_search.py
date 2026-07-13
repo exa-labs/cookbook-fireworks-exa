@@ -41,6 +41,13 @@ SYSTEM_PROMPT = (
     "answer should be concise -- a name, date, number, or short phrase."
 )
 
+# Injected before the last turn in both training (rollout.py) and eval
+# (eval.py); the two loops must present the identical environment.
+FINAL_TURN_NUDGE = (
+    "You are out of tool-call turns. Reply now without calling any tool and "
+    'give your final answer after the prefix "Answer:".'
+)
+
 EXA_SEARCH_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -103,7 +110,6 @@ class ExaSearchConfig:
     api_key: str | None = None
     search_type: str = "auto"
     num_results: int = 5
-    # Blog setup: 5 results x 2,000-char snippets; 10,000-char page fetches.
     max_snippet_chars: int = 2000
     max_contents_chars: int = 10000
     max_observation_chars: int = 15000

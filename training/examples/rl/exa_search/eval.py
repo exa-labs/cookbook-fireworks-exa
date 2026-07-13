@@ -23,17 +23,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import random
 import time
+import uuid
 
 import httpx
 from dotenv import load_dotenv
 
 from training.examples.rl.exa_search.exa_search import (
     EXA_SEARCH_TOOLS,
+    FINAL_TURN_NUDGE,
     SYSTEM_PROMPT,
     TOOL_NAME_GET_CONTENTS,
     TOOL_NAME_SEARCH,
@@ -58,10 +61,22 @@ load_dotenv(os.path.join(_TRAINING_ROOT, "..", ".env"))
 API_BASE = "https://api.fireworks.ai"
 INFERENCE_BASE = "https://api.fireworks.ai/inference/v1"
 
-_FINAL_TURN_NUDGE = (
-    "You are out of tool-call turns. Reply now without calling any tool and "
-    'give your final answer after the prefix "Answer:".'
-)
+
+def require_api_keys() -> None:
+    for var in ("FIREWORKS_API_KEY", "EXA_API_KEY"):
+        if not os.environ.get(var):
+            raise RuntimeError(f"{var} is not set (put it in training/.env).")
+
+
+def make_inference_client():
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(
+        base_url=INFERENCE_BASE,
+        api_key=os.environ["FIREWORKS_API_KEY"],
+        timeout=180.0,
+        max_retries=3,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +109,7 @@ class ControlPlane:
         return self._account_id
 
     def create_deployment(self, base_model: str, accelerator: str) -> str:
-        deployment_id = f"exa-search-eval-{int(time.time()) % 10_000_000}"
+        deployment_id = f"exa-search-eval-{uuid.uuid4().hex[:8]}"
         resp = self._http.post(
             f"/v1/accounts/{self.account_id}/deployments",
             params={"deploymentId": deployment_id},
@@ -172,6 +187,27 @@ class ControlPlane:
             logger.warning("Could not delete deployment %s: %s", name, resp.text[:200])
         else:
             logger.info("Deleted deployment %s", name)
+
+
+@contextlib.contextmanager
+def provisioned_deployment(
+    cp: ControlPlane, base_model: str, accelerator: str, deployment: str | None, keep: bool
+):
+    """Yield a ready deployment name, creating (and deleting) one if needed."""
+    created = False
+    if deployment and not deployment.startswith("accounts/"):
+        deployment = f"accounts/{cp.account_id}/deployments/{deployment}"
+    if deployment is None:
+        deployment = cp.create_deployment(base_model, accelerator)
+        created = True
+    try:
+        cp.wait_deployment_ready(deployment)
+        yield deployment
+    finally:
+        if created and not keep:
+            cp.delete_deployment(deployment)
+        elif created:
+            logger.info("Keeping deployment %s (billing until deleted)", deployment)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +317,7 @@ async def run_episode(
                 {"role": "tool", "tool_call_id": call["id"], "content": observation}
             )
         if turn + 2 >= max_turns:
-            messages.append({"role": "user", "content": _FINAL_TURN_NUDGE})
+            messages.append({"role": "user", "content": FINAL_TURN_NUDGE})
 
     return {
         "id": row["id"],
@@ -304,19 +340,10 @@ async def eval_model(
     rows: list[dict],
     out_dir: str,
     args: argparse.Namespace,
+    client,
+    exa_tool: ExaSearchTool,
+    judge: AnswerJudge,
 ) -> dict:
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(
-        base_url=INFERENCE_BASE,
-        api_key=os.environ["FIREWORKS_API_KEY"],
-        timeout=180.0,
-        max_retries=3,
-    )
-    exa_tool = ExaSearchTool(
-        ExaSearchConfig(search_type=args.search_type, num_results=args.num_results)
-    )
-    judge = AnswerJudge(JudgeConfig())
     semaphore = asyncio.Semaphore(args.concurrency)
     results: list[dict] = []
 
@@ -364,33 +391,69 @@ async def eval_model(
     return summary
 
 
+async def eval_models(
+    models: list[tuple[str, str]],
+    rows: list[dict],
+    out_dir: str,
+    args: argparse.Namespace,
+) -> list[dict]:
+    # One client and Exa tool for every model: the search cache is shared, so
+    # the tuned run reuses the base run's results for identical queries.
+    client = make_inference_client()
+    exa_tool = ExaSearchTool(
+        ExaSearchConfig(
+            search_type=args.search_type,
+            num_results=args.num_results,
+            max_requests_per_second=args.exa_qps,
+        )
+    )
+    judge = AnswerJudge(JudgeConfig())
+    summaries: list[dict] = []
+    for label, route in models:
+        logger.info("=== Evaluating %s (%s) ===", label, route)
+        summaries.append(
+            await eval_model(label, route, rows, out_dir, args, client, exa_tool, judge)
+        )
+    return summaries
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate the Exa search agent (base vs tuned)")
+def add_agent_args(
+    p: argparse.ArgumentParser, *, temperature: float, concurrency: int
+) -> None:
+    """Flags shared by every script that runs the agent loop off-recipe."""
     p.add_argument("--base-model", default="accounts/fireworks/models/qwen3-4b-instruct-2507")
-    p.add_argument("--lora", action="append", default=[],
-                   help="Promoted adapter model id to evaluate (repeatable).")
-    p.add_argument("--skip-base", action="store_true",
-                   help="Evaluate only the --lora model(s), not the base.")
     p.add_argument("--deployment", default=None,
                    help="Existing deployment id/name to route through (skips create+delete).")
     p.add_argument("--keep-deployment", action="store_true",
                    help="Do not delete the deployment this script created.")
-    p.add_argument("--accelerator", default="NVIDIA_B200_180GB")
-    p.add_argument("--dataset", default="mixed", choices=["mixed", "hotpotqa", "musique"])
-    p.add_argument("--difficulty", default="hard", choices=["hard", "medium", "easy", "all"])
-    p.add_argument("--limit", type=int, default=100)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--accelerator", default="NVIDIA_H100_80GB",
+                   help="Accelerator type for the created deployment (the API "
+                        "requires one; pick a tier your account has quota for).")
     p.add_argument("--max-turns", type=int, default=6)
-    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--temperature", type=float, default=temperature)
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--search-type", default="auto",
                    choices=["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"])
     p.add_argument("--num-results", type=int, default=5)
-    p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--exa-qps", type=float, default=10.0)
+    p.add_argument("--concurrency", type=int, default=concurrency)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Evaluate the Exa search agent (base vs tuned)")
+    add_agent_args(p, temperature=0.0, concurrency=8)
+    p.add_argument("--lora", action="append", default=[],
+                   help="Promoted adapter model id to evaluate (repeatable).")
+    p.add_argument("--skip-base", action="store_true",
+                   help="Evaluate only the --lora model(s), not the base.")
+    p.add_argument("--dataset", default="mixed", choices=["mixed", "hotpotqa", "musique"])
+    p.add_argument("--difficulty", default="hard", choices=["hard", "medium", "easy", "all"])
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", default=None,
                    help="Results directory (default: ./eval_results/<timestamp>).")
     return p.parse_args()
@@ -398,9 +461,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    for var in ("FIREWORKS_API_KEY", "EXA_API_KEY"):
-        if not os.environ.get(var):
-            raise RuntimeError(f"{var} is not set (put it in training/.env).")
+    require_api_keys()
 
     out_dir = args.out_dir or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "eval_results", time.strftime("%Y%m%d-%H%M%S")
@@ -410,40 +471,25 @@ def main() -> None:
     rows = load_eval_rows(args.dataset, args.limit, args.difficulty, args.seed)
     logger.info("Evaluating on %d held-out rows (%s)", len(rows), args.dataset)
 
-    cp = ControlPlane(os.environ["FIREWORKS_API_KEY"])
-    deployment = args.deployment
-    created_deployment = False
-    if deployment and not deployment.startswith("accounts/"):
-        deployment = f"accounts/{cp.account_id}/deployments/{deployment}"
-    if deployment is None:
-        deployment = cp.create_deployment(args.base_model, args.accelerator)
-        created_deployment = True
-
-    models: list[tuple[str, str]] = []
-    if not args.skip_base:
-        models.append(("base", f"{args.base_model}#{deployment}"))
-    for i, lora in enumerate(args.lora):
-        label = "tuned" if len(args.lora) == 1 else f"tuned-{i}"
-        models.append((label, f"{lora}#{deployment}"))
-
-    if not models:
+    if args.skip_base and not args.lora:
         raise RuntimeError("Nothing to evaluate: pass --lora and/or drop --skip-base.")
 
-    summaries: list[dict] = []
-    try:
-        cp.wait_deployment_ready(deployment)
+    cp = ControlPlane(os.environ["FIREWORKS_API_KEY"])
+    with provisioned_deployment(
+        cp, args.base_model, args.accelerator, args.deployment, args.keep_deployment
+    ) as deployment:
+        models: list[tuple[str, str]] = []
+        if not args.skip_base:
+            models.append(("base", f"{args.base_model}#{deployment}"))
+        for i, lora in enumerate(args.lora):
+            label = "tuned" if len(args.lora) == 1 else f"tuned-{i}"
+            models.append((label, f"{lora}#{deployment}"))
+
         for lora in args.lora:
             addon = cp.load_lora(lora, deployment)
             cp.wait_lora_ready(addon)
 
-        for label, route in models:
-            logger.info("=== Evaluating %s (%s) ===", label, route)
-            summaries.append(asyncio.run(eval_model(label, route, rows, out_dir, args)))
-    finally:
-        if created_deployment and not args.keep_deployment:
-            cp.delete_deployment(deployment)
-        elif created_deployment:
-            logger.info("Keeping deployment %s (billing until deleted)", deployment)
+        summaries = asyncio.run(eval_models(models, rows, out_dir, args))
 
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump({"dataset": args.dataset, "limit": args.limit, "models": summaries}, f, indent=2)

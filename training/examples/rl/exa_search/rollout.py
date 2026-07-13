@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from training.examples.rl.exa_search.exa_search import (
     EXA_SEARCH_TOOLS,
+    FINAL_TURN_NUDGE,
     TOOL_NAME_GET_CONTENTS,
     TOOL_NAME_SEARCH,
     ExaSearchConfig,
@@ -44,16 +45,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Terminal rewards for non-answer outcomes, overridable via rollout extras.
+CONTEXT_OVERFLOW_PENALTY = -0.25
+NO_ANSWER_PENALTY = -0.1
+
 _PARSE_FEEDBACK = (
     "Your tool call was malformed. Call one tool per turn as "
     '<tool_call>{"name": "search", "arguments": {"query": "..."}}</tool_call> '
     'or <tool_call>{"name": "get_contents", "arguments": {"url": "..."}}'
     "</tool_call>, or reply without any tool call to give your final answer."
-)
-
-_FINAL_TURN_NUDGE = (
-    "You are out of tool-call turns. Reply now without calling any tool and "
-    'give your final answer after the prefix "Answer:".'
 )
 
 
@@ -125,8 +125,8 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
         raise ValueError(f"max_turns must be >= 1, got {max_turns}")
     max_trajectory_tokens = int(extras.get("max_trajectory_tokens", 30720))
     max_completion_tokens = int(sample_kwargs.get("max_tokens", 0) or 0)
-    overflow_penalty = float(extras.get("context_overflow_penalty", -0.25))
-    no_answer_penalty = float(extras.get("no_answer_penalty", -0.1))
+    overflow_penalty = float(extras.get("context_overflow_penalty", CONTEXT_OVERFLOW_PENALTY))
+    no_answer_penalty = float(extras.get("no_answer_penalty", NO_ANSWER_PENALTY))
 
     exa_tool = ExaSearchTool(
         ExaSearchConfig(
@@ -253,7 +253,7 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
                 next_messages.append({"role": "user", "content": _PARSE_FEEDBACK})
 
             if turn + 2 >= max_turns:
-                next_messages.append({"role": "user", "content": _FINAL_TURN_NUDGE})
+                next_messages.append({"role": "user", "content": FINAL_TURN_NUDGE})
             current_messages = current_messages + [assistant_message] + next_messages
 
         if not done:
