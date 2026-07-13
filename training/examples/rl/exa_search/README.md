@@ -110,7 +110,12 @@ question ─▶ model ─▶ <tool_call> search(query) ──────▶ Exa
 # 1. Prepare data: the blog's 50/50 HotpotQA + MuSiQue mix (train splits).
 python prepare_data.py --max-rows 2000
 
-# 2. Train. The training shape selects the trainer + deployment GPU pair;
+# 2. (Optional) Pre-score difficulty offline, as the blog does, and keep only
+#    the questions RL can learn from (see "Data" below). Skippable: train.py
+#    filters at runtime by default.
+python prescore.py --samples 8 --temperature 1.0
+
+# 3. Train. The training shape selects the trainer + deployment GPU pair;
 #    its profile must reference a deployment shape (see skills/dev shapes.md).
 TRAINING_SHAPE=accounts/fireworks/trainingShapes/qwen3-4b-minimum-lora \
 python train.py \
@@ -122,6 +127,10 @@ python train.py \
     --search-type auto \
     --output-model-id exa-search-agent
 ```
+
+If you ran the optional pre-scoring step, train on its output instead:
+add `--dataset-path dataset.prescored.jsonl --no-filter-constant-reward`
+to the `train.py` command.
 
 `--output-model-id` is the bare id (lowercase a-z, 0-9, hyphens; max 63 chars)
 -- the promoted model lands at `accounts/<your-acct>/models/<id>`. It is
@@ -213,17 +222,13 @@ stay clean for evaluating the trained agent. Single-source variants
 
 By default, `train.py` drops constant-reward prompt groups **at runtime** (the
 `dynamic_filter_fn`): groups the model gets uniformly right or wrong have zero
-GRPO advantage, so they waste rollout budget. `prescore.py` moves that
-filtering **offline**, as the blog does: it samples the base model
-`--samples` times per question, keeps only the mixed-difficulty band
-(`0 < correct < samples`), and writes `dataset.prescored.jsonl`. Train on it
-with `--dataset-path dataset.prescored.jsonl --no-filter-constant-reward`;
-nearly every group then yields a gradient, at the cost of one up-front scoring
-pass (it provisions and tears down a deployment, like `eval.py`).
-
-```bash
-python prescore.py --samples 8 --temperature 1.0
-```
+GRPO advantage, so they waste rollout budget. The optional `prescore.py` step
+(Quick start, step 2) moves that filtering **offline**, as the blog does: it
+samples the base model `--samples` times per question, keeps only the
+mixed-difficulty band (`0 < correct < samples`), and writes
+`dataset.prescored.jsonl`. Trained on that file, nearly every group yields a
+gradient, at the cost of one up-front scoring pass (it provisions and tears
+down a deployment, like `eval.py`).
 
 The blog trains with **Dr. GRPO**; the recipe's default `policy_loss="grpo"`
 (REINFORCE + KL) is the closest available variant; see the async-RL reference
