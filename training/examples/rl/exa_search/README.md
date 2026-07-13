@@ -180,9 +180,9 @@ It provisions one dedicated deployment of the base model, attaches the
 adapter(s) as LoRA addons, evaluates every model through that single GPU, and
 deletes the deployment on exit (`--keep-deployment` / `--deployment <id>` to
 reuse one). The deployment defaults to `--accelerator NVIDIA_H100_80GB`; pick
-a tier your account has quota for. Per-question transcripts land in `eval_results/<timestamp>/`; the
-summary table reports accuracy, searches/episode, turns/episode, and
-no-answer rate per model.
+a tier your account has quota for. Per-question transcripts land in
+`eval_results/<timestamp>/`; the summary table reports accuracy,
+searches/episode, turns/episode, and no-answer rate per model.
 
 ## Key hyperparameters
 
