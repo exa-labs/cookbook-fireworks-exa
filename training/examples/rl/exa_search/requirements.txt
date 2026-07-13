@@ -1,0 +1,7 @@
+# Extra dependency for this example, on top of the cookbook's `training` deps
+# (fireworks-ai[training], datasets, transformers, python-dotenv, openai...).
+#
+#   pip install -r requirements.txt
+#
+# Exa Python SDK: the web-search backend the agent calls during rollouts.
+exa-py>=1.0.0
