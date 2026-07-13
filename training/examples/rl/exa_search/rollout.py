@@ -15,7 +15,10 @@ trajectory) -- raising here would abort the whole training run.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import TYPE_CHECKING, Sequence
 
 from training.examples.rl.exa_search.exa_search import (
@@ -27,7 +30,7 @@ from training.examples.rl.exa_search.exa_search import (
     extract_answer,
     parse_tool_calls,
 )
-from training.examples.rl.exa_search.reward import AnswerJudge, JudgeConfig
+from training.examples.rl.exa_search.reward import AnswerJudge, JudgeConfig, JudgeError
 from training.examples.rl.vanilla_sampler import build_deployment_sampler
 from training.utils.rl.rollout import (
     MessageTrajectoryAssembler,
@@ -99,11 +102,23 @@ def _question_text(sample_prompt: dict, messages: list[dict]) -> str:
     return ""
 
 
+def _append_jsonl(path: str, record: dict) -> None:
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        logger.warning("Could not append rollout stats to %s", path, exc_info=True)
+
+
 def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
     sampler = build_deployment_sampler(setup)
     sample_kwargs = dict(setup.sample_kwargs)
     tokenizer = setup.tokenizer
     extras = setup.extras
+
+    stats_path = extras.get("stats_path")
+    if stats_path:
+        os.makedirs(os.path.dirname(os.path.abspath(stats_path)), exist_ok=True)
 
     max_turns = int(extras.get("max_turns", 6))
     if max_turns < 1:
@@ -117,11 +132,11 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
         ExaSearchConfig(
             search_type=str(extras.get("search_type", "auto")),
             num_results=int(extras.get("num_results", 5)),
+            max_requests_per_second=float(extras.get("exa_qps", 10.0)),
         )
     )
     judge = AnswerJudge(
         JudgeConfig(
-            enabled=bool(extras.get("judge_enabled", True)),
             **({"model": extras["judge_model"]} if extras.get("judge_model") else {}),
         )
     )
@@ -137,6 +152,12 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
         current_messages = messages
         reward = no_answer_penalty
         done = False
+        outcome = "no_answer"
+        final_answer = ""
+        turns_used = 0
+        n_search = 0
+        n_get_contents = 0
+        n_parse_errors = 0
 
         for turn in range(max_turns):
             prompt_tokens = assembler.prepare_next_input(
@@ -154,6 +175,7 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
                     return None
                 reward = overflow_penalty
                 done = True
+                outcome = "overflow"
                 break
 
             try:
@@ -184,13 +206,22 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
                 finish_reason=getattr(completion, "finish_reason", "stop"),
             )
 
+            turns_used = turn + 1
             tool_calls, had_invalid = parse_tool_calls(assistant_text)
+            if had_invalid:
+                n_parse_errors += 1
 
             if not tool_calls and not had_invalid:
                 # No tool call: this message is the final answer.
                 answer = extract_answer(assistant_text)
-                reward = await judge(question, answer, gold_answers)
+                try:
+                    reward = await judge(question, answer, gold_answers)
+                except JudgeError:
+                    logger.warning("Judge could not grade trajectory; dropping", exc_info=True)
+                    return None
                 done = True
+                outcome = "answered"
+                final_answer = answer
                 break
 
             if turn + 1 >= max_turns:
@@ -200,8 +231,10 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
             next_messages: list[dict] = []
             for call in tool_calls:
                 if call.name == TOOL_NAME_SEARCH:
+                    n_search += 1
                     observation = await exa_tool.search(str(call.arguments.get("query", "")))
                 elif call.name == TOOL_NAME_GET_CONTENTS:
+                    n_get_contents += 1
                     observation = await exa_tool.get_contents(str(call.arguments.get("url", "")))
                 else:
                     observation = (
@@ -227,6 +260,23 @@ def make_rollout_fn(setup: "RolloutSetup") -> "RolloutFn":
             reward = no_answer_penalty
 
         tokens, logprobs, loss_mask = assembler.trajectory.to_flat()
+        if stats_path:
+            _append_jsonl(
+                stats_path,
+                {
+                    "ts": round(time.time(), 3),
+                    "id": sample_prompt.get("id"),
+                    "source": sample_prompt.get("source"),
+                    "reward": reward,
+                    "outcome": outcome,
+                    "turns": turns_used,
+                    "search_calls": n_search,
+                    "get_contents_calls": n_get_contents,
+                    "parse_errors": n_parse_errors,
+                    "trajectory_tokens": len(tokens),
+                    "answer": final_answer[:300],
+                },
+            )
         sample = RolloutSample(
             tokens=tokens,
             logprobs=logprobs,

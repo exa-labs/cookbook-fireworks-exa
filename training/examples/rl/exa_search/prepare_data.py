@@ -51,10 +51,15 @@ def _row(idx: int, source: str, question: str, gold: list[str]) -> dict:
 
 
 def load_peterjin_hotpotqa(split: str, max_rows: int) -> list[dict]:
-    """HotpotQA rows from the blog's source set, skipping its single-hop NQ
-    rows.  Streamed: the full split is ~170k rows."""
+    """HotpotQA rows from the blog's source set, skipping its single-hop NQ rows."""
     hf_split = "train" if split == "train" else "test"
-    ds = load_dataset("PeterJinGo/nq_hotpotqa_train", split=hf_split, streaming=True)
+    # Load just this split's parquet: the repo's train/test schemas differ,
+    # and the default builder fails preparing the other split.
+    ds = load_dataset(
+        "PeterJinGo/nq_hotpotqa_train",
+        data_files={hf_split: f"{hf_split}.parquet"},
+        split=hf_split,
+    )
     rows: list[dict] = []
     for row in ds:
         if row.get("data_source") != "hotpotqa":

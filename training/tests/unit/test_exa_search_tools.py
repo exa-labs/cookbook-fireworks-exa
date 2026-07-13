@@ -1,7 +1,8 @@
 """Unit tests for the exa_search RL example's pure helpers.
 
-Covers the tool-call parser, answer extraction, tool specs, token-F1, and
-judge fallback/fail-fast.  No network, no Exa/Fireworks credentials.
+Covers the tool-call parser, answer extraction, tool specs, and the LLM judge
+(verdict parsing, drop-on-failure, and fail-fast).  No network, no Exa/Fireworks
+credentials -- the judge's OpenAI client is faked.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from training.examples.rl.exa_search.exa_search import (
     EXA_SEARCH_TOOLS,
     TOOL_NAME_GET_CONTENTS,
     TOOL_NAME_SEARCH,
+    _AsyncRateLimiter,
     extract_answer,
     parse_tool_calls,
     strip_think,
@@ -21,9 +23,36 @@ from training.examples.rl.exa_search.exa_search import (
 from training.examples.rl.exa_search.reward import (
     AnswerJudge,
     JudgeConfig,
-    best_token_f1,
-    token_f1,
+    JudgeError,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fake OpenAI-compatible client (no network)
+# ---------------------------------------------------------------------------
+
+class _FakeCompletions:
+    def __init__(self, content=None, exc=None):
+        self._content = content
+        self._exc = exc
+
+    async def create(self, **kwargs):
+        if self._exc is not None:
+            raise self._exc
+        msg = type("Msg", (), {"content": self._content})()
+        choice = type("Choice", (), {"message": msg})()
+        return type("Resp", (), {"choices": [choice]})()
+
+
+class _FakeClient:
+    def __init__(self, content=None, exc=None):
+        self.chat = type("Chat", (), {"completions": _FakeCompletions(content, exc)})()
+
+
+def _judge_with_client(content=None, exc=None, **cfg):
+    judge = AnswerJudge(JudgeConfig(api_key="test-key", **cfg))
+    judge._client = _FakeClient(content=content, exc=exc)  # bypass _get_client
+    return judge
 
 
 # ---------------------------------------------------------------------------
@@ -137,44 +166,67 @@ def test_strip_think_handles_closed_and_truncated_blocks():
     assert strip_think("x<think>truncated tail") == "x"
 
 
+def test_rate_limiter_paces_concurrent_acquires():
+    async def run() -> float:
+        limiter = _AsyncRateLimiter(rate=100.0)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await asyncio.gather(*(limiter.acquire() for _ in range(10)))
+        return loop.time() - start
+
+    # 10 acquires at 100/s occupy at least 9 x 10ms slots.
+    assert asyncio.run(run()) >= 0.09
+
+
 # ---------------------------------------------------------------------------
-# Reward: token-F1 and judge fallback / fail-fast
+# Reward: LLM judge (faked client) -- verdicts, drop-on-failure, fail-fast
 # ---------------------------------------------------------------------------
 
-def test_token_f1():
-    assert token_f1("Arthur's Magazine", "Arthur's Magazine") == 1.0
-    assert 0.0 < token_f1("Arthur's Magazine (1844)", "Arthur's Magazine") < 1.0
-    assert token_f1("The Atlantic", "Arthur's Magazine") == 0.0
-
-
-def test_best_token_f1_over_aliases():
-    assert best_token_f1("406 AD", ["406", "406 CE"]) > 0.0
-    assert best_token_f1("anything", []) == 0.0
-
-
-def test_disabled_judge_grades_with_f1():
-    judge = AnswerJudge(JudgeConfig(enabled=False))
+def test_judge_correct_verdict_scores_one():
+    judge = _judge_with_client(content="CORRECT")
     assert asyncio.run(judge("Q", "Paris", ["Paris"])) == 1.0
+
+
+def test_judge_incorrect_verdict_scores_zero():
+    judge = _judge_with_client(content="INCORRECT")
+    assert asyncio.run(judge("Q", "London", ["Paris"])) == 0.0
+
+
+def test_judge_incorrect_wins_over_substring_correct():
+    # "INCORRECT" contains "CORRECT"; the verdict must resolve to 0.0.
+    judge = _judge_with_client(content="INCORRECT")
     assert asyncio.run(judge("Q", "London", ["Paris"])) == 0.0
 
 
 def test_empty_answer_is_incorrect_without_calling_judge():
-    judge = AnswerJudge(JudgeConfig(enabled=True, api_key=None))
+    judge = AnswerJudge(JudgeConfig(api_key=None))  # no client needed
     assert asyncio.run(judge("Q", "", ["Paris"])) == 0.0
 
 
 def test_missing_api_key_raises_instead_of_silently_grading():
-    judge = AnswerJudge(JudgeConfig(enabled=True, api_key=None))
+    judge = AnswerJudge(JudgeConfig(api_key=None))
     with pytest.raises(RuntimeError, match="judge API key"):
         asyncio.run(judge("Q", "Paris", ["Paris"]))
 
 
+def test_unparseable_verdict_raises_judge_error():
+    judge = _judge_with_client(content="maybe?")
+    with pytest.raises(JudgeError, match="unparseable"):
+        asyncio.run(judge("Q", "Paris", ["Paris"]))
+
+
+def test_api_failure_raises_judge_error():
+    judge = _judge_with_client(exc=RuntimeError("boom"))
+    with pytest.raises(JudgeError, match="judge call failed"):
+        asyncio.run(judge("Q", "Paris", ["Paris"]))
+
+
 def test_judge_fail_fast_after_consecutive_failures():
-    judge = AnswerJudge(JudgeConfig(enabled=False, max_consecutive_failures=3))
-    assert judge._note_failure("Paris", ["Paris"]) == 1.0
-    assert judge._note_failure("London", ["Paris"]) == 0.0
+    judge = AnswerJudge(JudgeConfig(max_consecutive_failures=3))
+    judge._register_failure()  # 1
+    judge._register_failure()  # 2
     with pytest.raises(RuntimeError, match="failed 3 times in a row"):
-        judge._note_failure("Paris", ["Paris"])
+        judge._register_failure()  # 3 -> fatal
 
 
 def test_judge_env_overrides(monkeypatch):

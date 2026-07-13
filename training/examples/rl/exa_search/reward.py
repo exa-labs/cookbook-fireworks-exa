@@ -2,17 +2,23 @@
 
 An LLM judge grades the final answer against the gold answer(s), 1.0 or 0.0.
 Multi-hop QA gold answers are short free-text strings that correct models
-routinely rephrase, so exact matching under-counts; the judge is any
-OpenAI-compatible endpoint, configured via ``JudgeConfig`` or environment
-variables:
+routinely rephrase, so exact matching under-counts (and the agent learns to
+game it); the judge is any OpenAI-compatible endpoint, configured via
+``JudgeConfig`` or environment variables:
 
-    JUDGE_MODEL       (default: accounts/fireworks/models/qwen3-30b-a3b-instruct-2507)
-    JUDGE_BASE_URL    (default: https://api.fireworks.ai/inference/v1)
-    JUDGE_API_KEY     (default: $FIREWORKS_API_KEY)
+    JUDGE_MODEL             (default: accounts/fireworks/models/qwen3p7-plus)
+    JUDGE_BASE_URL          (default: https://api.fireworks.ai/inference/v1)
+    JUDGE_API_KEY           (default: $FIREWORKS_API_KEY)
+    JUDGE_REASONING_EFFORT  (default: "none"; set empty to omit the param)
 
-The judge must be a non-thinking instruct model: a reasoning judge opens with
-``<think>`` and the small ``max_tokens`` would truncate the verdict.
-``token_f1`` is the offline fallback (``JudgeConfig(enabled=False)``).
+The judge must answer without a reasoning trace, or the small ``max_tokens``
+truncates the verdict: use a non-thinking instruct model, or a hybrid model
+with reasoning disabled (``reasoning_effort="none"``).
+
+A judge call that fails or returns an unparseable verdict raises ``JudgeError``;
+the caller drops that trajectory. ``max_consecutive_failures`` failures in a row
+raise a fatal error instead, so a misconfigured judge fails loudly rather than
+silently draining the dataset.
 """
 
 from __future__ import annotations
@@ -20,50 +26,15 @@ from __future__ import annotations
 import logging
 import os
 import re
-import string
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Token-F1 fallback (SQuAD-style; no network, no API key)
-# ---------------------------------------------------------------------------
+class JudgeError(RuntimeError):
+    """The judge could not produce a verdict for one candidate answer."""
 
-def _normalize_answer(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    s = "".join(ch for ch in s if ch not in string.punctuation)
-    return " ".join(s.split())
-
-
-def token_f1(prediction: str, ground_truth: str) -> float:
-    """SQuAD-style token-level F1 between a prediction and one gold answer."""
-    pred_tokens = _normalize_answer(prediction).split()
-    gt_tokens = _normalize_answer(ground_truth).split()
-    if not gt_tokens:
-        return 1.0 if not pred_tokens else 0.0
-    if not pred_tokens:
-        return 0.0
-    common = Counter(pred_tokens) & Counter(gt_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(gt_tokens)
-    return 2 * precision * recall / (precision + recall)
-
-
-def best_token_f1(prediction: str, gold_answers: Sequence[str]) -> float:
-    """Max token-F1 over a set of acceptable gold answers."""
-    return max((token_f1(prediction, g) for g in gold_answers), default=0.0)
-
-
-# ---------------------------------------------------------------------------
-# LLM-as-judge
-# ---------------------------------------------------------------------------
 
 _JUDGE_SYSTEM_PROMPT = (
     "You are a strict grader for a question-answering system. You are given a "
@@ -92,12 +63,14 @@ _THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL)
 class JudgeConfig:
     """Configuration for the LLM judge."""
 
-    enabled: bool = True
     model: str = field(
         default_factory=lambda: os.environ.get(
             "JUDGE_MODEL",
-            "accounts/fireworks/models/qwen3-30b-a3b-instruct-2507",
+            "accounts/fireworks/models/qwen3p7-plus",
         )
+    )
+    reasoning_effort: str | None = field(
+        default_factory=lambda: os.environ.get("JUDGE_REASONING_EFFORT", "none") or None
     )
     base_url: str = field(
         default_factory=lambda: os.environ.get(
@@ -111,33 +84,32 @@ class JudgeConfig:
     max_tokens: int = 16
     temperature: float = 0.0
     timeout: float = 30.0
-    # Failures in a row before raising instead of falling back to F1.
+    # Consecutive failures before raising a fatal error instead of dropping the
+    # trajectory -- guards against a misconfigured judge silently draining data.
     max_consecutive_failures: int = 10
 
 
 class AnswerJudge:
     """Grades a candidate answer against gold answer(s) with an LLM judge.
 
-    Isolated judge failures fall back to token-F1; ``max_consecutive_failures``
-    failures in a row raise instead of silently mis-grading the run.
+    Returns 1.0 (correct) or 0.0 (incorrect). A failed or unparseable judge
+    call raises ``JudgeError`` so the caller can drop that one trajectory;
+    ``max_consecutive_failures`` in a row raise a fatal error instead.
     """
 
-    def __init__(self, config: JudgeConfig | None = None, *, f1_threshold: float = 0.6):
+    def __init__(self, config: JudgeConfig | None = None):
         self.config = config or JudgeConfig()
-        self.f1_threshold = f1_threshold
         self._client = None
         self._consecutive_failures = 0
 
     def _get_client(self):
         if self._client is None:
-            # Lazy import: `token_f1` works with no optional deps.
-            from openai import AsyncOpenAI
-
             if not self.config.api_key:
                 raise RuntimeError(
-                    "No judge API key. Set FIREWORKS_API_KEY (or JUDGE_API_KEY), "
-                    "or disable the judge with JudgeConfig(enabled=False)."
+                    "No judge API key. Set FIREWORKS_API_KEY (or JUDGE_API_KEY)."
                 )
+            from openai import AsyncOpenAI
+
             self._client = AsyncOpenAI(
                 base_url=self.config.base_url,
                 api_key=self.config.api_key,
@@ -145,35 +117,30 @@ class AnswerJudge:
             )
         return self._client
 
-    def _f1_reward(self, answer: str, gold_answers: Sequence[str]) -> float:
-        return 1.0 if best_token_f1(answer, gold_answers) >= self.f1_threshold else 0.0
-
-    def _note_failure(self, answer: str, gold_answers: Sequence[str]) -> float:
+    def _register_failure(self) -> None:
         self._consecutive_failures += 1
         if self._consecutive_failures >= self.config.max_consecutive_failures:
             raise RuntimeError(
                 f"LLM judge failed {self._consecutive_failures} times in a row "
                 f"(model={self.config.model!r}, base_url={self.config.base_url!r}). "
-                "Refusing to silently grade the run with the F1 fallback -- "
-                "check the judge model id and API key, or pass --no-judge."
+                "Check the judge model id and API key."
             )
-        return self._f1_reward(answer, gold_answers)
 
     async def __call__(
         self, question: str, answer: str, gold_answers: Sequence[str]
     ) -> float:
-        """Return 1.0 if ``answer`` is judged correct for ``question``, else 0.0."""
+        """Return 1.0 if ``answer`` is judged correct for ``question``, else 0.0.
+
+        Raises ``JudgeError`` if the judge call fails or is unparseable.
+        """
         answer = (answer or "").strip()
         gold_answers = [g for g in gold_answers if g] or [""]
         if not answer:
             return 0.0
 
-        if not self.config.enabled:
-            return self._f1_reward(answer, gold_answers)
-
+        client = self._get_client()  # missing key -> RuntimeError (fatal config error)
+        gold_str = "\n".join(f"- {g}" for g in gold_answers)
         try:
-            client = self._get_client()
-            gold_str = "\n".join(f"- {g}" for g in gold_answers)
             resp = await client.chat.completions.create(
                 model=self.config.model,
                 messages=[
@@ -187,19 +154,26 @@ class AnswerJudge:
                 ],
                 max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature,
+                extra_body=(
+                    {"reasoning_effort": self.config.reasoning_effort}
+                    if self.config.reasoning_effort
+                    else {}
+                ),
             )
             verdict = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
-            # Check INCORRECT first: it contains the substring "CORRECT".
-            if _INCORRECT_RE.search(verdict):
-                self._consecutive_failures = 0
-                return 0.0
-            if _CORRECT_RE.search(verdict):
-                self._consecutive_failures = 0
-                return 1.0
-            logger.warning("Judge returned unparseable verdict %r; using F1 fallback", verdict)
-            return self._note_failure(answer, gold_answers)
-        except RuntimeError:
-            raise
-        except Exception:
-            logger.warning("LLM judge call failed; using token-F1 fallback", exc_info=True)
-            return self._note_failure(answer, gold_answers)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM judge call failed", exc_info=True)
+            self._register_failure()
+            raise JudgeError(f"judge call failed: {exc}") from exc
+
+        # Check INCORRECT first: it contains the substring "CORRECT".
+        if _INCORRECT_RE.search(verdict):
+            self._consecutive_failures = 0
+            return 0.0
+        if _CORRECT_RE.search(verdict):
+            self._consecutive_failures = 0
+            return 1.0
+
+        logger.warning("Judge returned unparseable verdict %r", verdict)
+        self._register_failure()
+        raise JudgeError(f"unparseable verdict: {verdict!r}")

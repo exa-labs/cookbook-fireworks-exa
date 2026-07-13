@@ -96,6 +96,10 @@ def parse_args() -> argparse.Namespace:
                    help="Exa search type. 'fast' is cheaper/lower-latency for high-throughput RL.")
     p.add_argument("--num-results", type=int, default=5,
                    help="Exa results returned per search (blog: 5).")
+    p.add_argument("--exa-qps", type=float, default=10.0,
+                   help="Client-side cap on Exa API requests/second across all "
+                        "concurrent rollouts (Exa's default account limit is 10; "
+                        "0 disables).")
     p.add_argument("--max-trajectory-tokens", type=int, default=30720,
                    help="Hard cap on prompt+completion tokens per trajectory; exceeding it "
                         "ends the episode with the context-overflow penalty (blog: 30720).")
@@ -105,11 +109,18 @@ def parse_args() -> argparse.Namespace:
                    help="Reward when the agent burns all turns without giving a final answer.")
     p.add_argument("--judge-model", default=None,
                    help="Override the LLM judge model (default: "
-                        "accounts/fireworks/models/qwen3-30b-a3b-instruct-2507; use a "
-                        "non-thinking instruct model).")
-    p.add_argument("--no-judge", action="store_true",
-                   help="Disable the LLM judge; grade with token-F1 instead (offline / no judge key).")
+                        "accounts/fireworks/models/qwen3p7-plus; the judge must "
+                        "answer without a reasoning trace).")
     # Infra / logging
+    p.add_argument("--dcp-save-interval", type=int, default=10,
+                   help="Save a resumable checkpoint every N optimizer steps (0 = final only).")
+    p.add_argument("--init-from-checkpoint", default=None,
+                   help="Resume from a prior checkpoint to train further. Cross-job "
+                        "form is \"<job-id>:step-N\" (e.g. the printed trainer job id "
+                        "plus \"step-60\"); a bare \"step-N\" resumes within the same "
+                        "job. Resume restores optimizer state, step count, and how many "
+                        "rows were already consumed -- raise --epochs or --max-rows so "
+                        "there is fresh data left to train on.")
     p.add_argument("--training-shape-id", default=os.environ.get("TRAINING_SHAPE") or None,
                    help="Training shape resource name; auto-selected if unset.")
     p.add_argument("--replica-count", type=int, default=None,
@@ -132,9 +143,22 @@ def run() -> None:
             "EXA_API_KEY is not set. Add it to training/.env "
             "(get a key at https://dashboard.exa.ai/api-keys)."
         )
+    if args.output_model_id:
+        from fireworks.training.sdk import validate_output_model_id
+
+        errors = validate_output_model_id(args.output_model_id)
+        if errors:
+            raise ValueError(
+                "Invalid --output-model-id (fix now, not after training): "
+                + "; ".join(errors)
+            )
 
     rows = list(_iter_rows(args.dataset_path, args.max_rows))
     logger.info("Loaded %d rows from %s", len(rows), args.dataset_path)
+
+    # One identifier per run, shared by the stats file and the wandb run so
+    # artifacts correlate by the run's identity, not by a fragile timestamp.
+    run_tag = args.wandb_run_name or args.output_model_id or f"run-{int(time.time())}"
 
     cfg = Config(
         log_path=args.log_path,
@@ -150,6 +174,8 @@ def run() -> None:
         prompt_groups_per_step=args.prompt_groups_per_step,
         max_head_offpolicy_versions=args.max_head_offpolicy_versions,
         max_concurrency_rollout_sample=args.max_concurrency_rollout_sample,
+        dcp_save_interval=args.dcp_save_interval,
+        init_from_checkpoint=args.init_from_checkpoint,
         output_model_id=args.output_model_id,
         trainer=TrainerConfig(training_shape_id=args.training_shape_id),
         deployment=DeployConfig(
@@ -159,7 +185,7 @@ def run() -> None:
         wandb=WandBConfig(
             entity=args.wandb_entity,
             project=args.wandb_project,
-            run_name=args.wandb_run_name or f"exa-search-{int(time.time()) % 100000}",
+            run_name=run_tag,
         ),
     )
 
@@ -169,14 +195,16 @@ def run() -> None:
         else (lambda pg: len(set(pg.rewards)) > 1)
     )
 
+    stats_path = os.path.join(args.log_path, f"rollout_stats-{run_tag}.jsonl")
     rollout_extras = {
+        "stats_path": stats_path,
         "max_turns": args.max_turns,
         "search_type": args.search_type,
         "num_results": args.num_results,
+        "exa_qps": args.exa_qps,
         "max_trajectory_tokens": args.max_trajectory_tokens,
         "context_overflow_penalty": args.context_overflow_penalty,
         "no_answer_penalty": args.no_answer_penalty,
-        "judge_enabled": not args.no_judge,
         "judge_model": args.judge_model,
     }
 
@@ -185,6 +213,7 @@ def run() -> None:
         args.base_model, len(rows), args.epochs, args.completions_per_prompt,
         args.prompt_groups_per_step, args.max_turns, args.search_type,
     )
+    logger.info("Per-rollout stats -> %s", stats_path)
 
     main(
         cfg,

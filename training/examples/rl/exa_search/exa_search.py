@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -109,6 +110,27 @@ class ExaSearchConfig:
     max_attempts: int = 3
     retry_backoff_seconds: float = 1.0
     cache_size: int = 4096
+    # Exa accounts are rate-limited (default 10 requests/second); pace all
+    # API calls across concurrent rollouts to stay under it.  0 disables.
+    max_requests_per_second: float = 10.0
+
+
+class _AsyncRateLimiter:
+    """Evenly spaces acquisitions at ``rate`` per second across coroutines."""
+
+    def __init__(self, rate: float):
+        self._interval = 1.0 / rate
+        self._lock = asyncio.Lock()
+        self._next_free = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_free)
+            self._next_free = start + self._interval
+            wait = start - now
+        if wait > 0:
+            await asyncio.sleep(wait)
 
 
 class ExaSearchTool:
@@ -132,6 +154,11 @@ class ExaSearchTool:
 
         self._exa = AsyncExa(api_key=api_key)
         self._cache: dict[tuple, str] = {}
+        self._limiter = (
+            _AsyncRateLimiter(self.config.max_requests_per_second)
+            if self.config.max_requests_per_second > 0
+            else None
+        )
 
     async def search(self, query: str) -> str:
         query = (query or "").strip()
@@ -196,6 +223,8 @@ class ExaSearchTool:
         last_exc: Exception | None = None
         for attempt in range(self.config.max_attempts):
             try:
+                if self._limiter is not None:
+                    await self._limiter.acquire()
                 return await thunk()
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
