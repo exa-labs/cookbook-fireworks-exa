@@ -5,3 +5,4 @@ smoke.jsonl
 # Training run artifacts.
 exa_search_logs/
 *_logs/
+eval_results/
